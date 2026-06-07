@@ -15,6 +15,13 @@
       "when": 1780866184629,
       "tag": "0001_blushing_switch",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1780868538203,
+      "tag": "0002_melodic_satana",
+      "breakpoints": true
     }
   ]
 }
