@@ -8,11 +8,19 @@ import { KanbanBoard } from "@/app/kanban/kanban-board";
 import { AppShell } from "@/components/app-shell";
 import { UnauthenticatedUserError } from "@/lib/auth/sync-user";
 
-export default async function KanbanPage() {
+export default async function KanbanPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ boardId?: string }>;
+}) {
   let boards: KanbanBoardView[] = [];
+  const params = await searchParams;
+  const selectedBoardId = params.boardId ? Number(params.boardId) : null;
 
   try {
-    boards = await listKanbanBoards();
+    boards = await listKanbanBoards(
+      Number.isInteger(selectedBoardId) ? selectedBoardId : null,
+    );
   } catch (error) {
     if (error instanceof UnauthenticatedUserError) {
       redirect("/sign-in");
@@ -23,7 +31,12 @@ export default async function KanbanPage() {
 
   return (
     <AppShell>
-      <KanbanBoard initialBoards={boards} />
+      <KanbanBoard
+        initialBoards={boards}
+        initialSelectedBoardId={
+          Number.isInteger(selectedBoardId) ? selectedBoardId : null
+        }
+      />
     </AppShell>
   );
 }

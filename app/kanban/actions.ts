@@ -1,23 +1,45 @@
 "use server";
 
-import { and, asc, eq } from "drizzle-orm";
+import { clerkClient } from "@clerk/nextjs/server";
+import { and, asc, eq, inArray, or } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
+import { headers } from "next/headers";
 
 import {
   calendarItems,
   db,
+  kanbanBoardCollaborators,
   kanbanBoards,
   kanbanColumns,
   kanbanTasks,
+  users,
 } from "@/db";
 import { syncCurrentUserToDatabase } from "@/lib/auth/sync-user";
+import { getKanbanRoomId, syncKanbanRoomAccess } from "@/lib/liveblocks/server";
 
 export type KanbanPriority = "Low" | "Medium" | "High";
+export type KanbanAccessRole = "owner" | "full_edit";
 
 export type KanbanLabel = {
   id: string;
   name: string;
   color: string;
+};
+
+export type KanbanUserView = {
+  id: number;
+  email: string;
+  name: string;
+  imageUrl: string | null;
+  color: string;
+};
+
+export type KanbanCollaboratorView = {
+  id: number;
+  email: string;
+  role: "full_edit";
+  status: "pending" | "accepted";
+  user: KanbanUserView | null;
 };
 
 export type KanbanTaskView = {
@@ -46,6 +68,10 @@ export type KanbanBoardView = {
   id: number;
   name: string;
   color: string;
+  roomId: string;
+  accessRole: KanbanAccessRole;
+  owner: KanbanUserView;
+  collaborators: KanbanCollaboratorView[];
   columns: KanbanColumnView[];
 };
 
@@ -65,10 +91,16 @@ export type TaskInput = {
   linkToNotes: boolean;
 };
 
+export type InviteCollaboratorResult = {
+  collaborator: KanbanCollaboratorView;
+  message: string;
+};
+
 const defaultColumnNames = ["Todo", "In Progress", "Done"];
 const maxColumnsPerBoard = 5;
 const priorities = new Set<KanbanPriority>(["Low", "Medium", "High"]);
 const colorPattern = /^#[0-9a-fA-F]{6}$/;
+const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const labelColors = new Set([
   "#38bdf8",
   "#34d399",
@@ -76,6 +108,15 @@ const labelColors = new Set([
   "#fb7185",
   "#8b5cf6",
 ]);
+const userColors = [
+  "#38bdf8",
+  "#34d399",
+  "#f59e0b",
+  "#fb7185",
+  "#8b5cf6",
+  "#14b8a6",
+  "#f97316",
+];
 
 function assertId(value: number, label: string) {
   if (!Number.isInteger(value) || value <= 0) {
@@ -87,6 +128,16 @@ function assertDateValue(value: string) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     throw new Error("Use a date in YYYY-MM-DD format.");
   }
+}
+
+function normalizeEmail(value: string) {
+  const email = value.trim().toLowerCase();
+
+  if (!emailPattern.test(email)) {
+    throw new Error("Enter a valid email address.");
+  }
+
+  return email;
 }
 
 function normalizeBoardInput(input: BoardInput) {
@@ -163,6 +214,27 @@ function parseLabels(value: string): KanbanLabel[] {
   }
 }
 
+function getUserColor(seed: string | number) {
+  const text = String(seed);
+  let hash = 0;
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash = (hash + text.charCodeAt(index) * (index + 1)) % userColors.length;
+  }
+
+  return userColors[hash];
+}
+
+function toUserView(user: typeof users.$inferSelect): KanbanUserView {
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name || user.email,
+    imageUrl: user.imageUrl,
+    color: getUserColor(user.email),
+  };
+}
+
 function toTaskView(task: typeof kanbanTasks.$inferSelect): KanbanTaskView {
   return {
     id: task.id,
@@ -179,22 +251,56 @@ function toTaskView(task: typeof kanbanTasks.$inferSelect): KanbanTaskView {
   };
 }
 
-async function assertBoardForUser(boardId: number, userId: number) {
-  assertId(boardId, "Board");
+async function attachCurrentUserToCollaborations(user: typeof users.$inferSelect) {
+  await db
+    .update(kanbanBoardCollaborators)
+    .set({
+      userId: user.id,
+      status: "accepted",
+      acceptedAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .where(eq(kanbanBoardCollaborators.email, user.email.toLowerCase()));
+}
 
-  const [board] = await db
-    .select()
+export async function assertKanbanBoardAccess(boardId: number) {
+  const user = await syncCurrentUserToDatabase();
+  await attachCurrentUserToCollaborations(user);
+
+  const [owned] = await db
+    .select({ board: kanbanBoards })
     .from(kanbanBoards)
-    .where(and(eq(kanbanBoards.id, boardId), eq(kanbanBoards.userId, userId)));
+    .where(and(eq(kanbanBoards.id, boardId), eq(kanbanBoards.userId, user.id)));
 
-  if (!board) {
+  if (owned) {
+    return { board: owned.board, user, accessRole: "owner" as const };
+  }
+
+  const [shared] = await db
+    .select({ board: kanbanBoards, collaborator: kanbanBoardCollaborators })
+    .from(kanbanBoardCollaborators)
+    .innerJoin(
+      kanbanBoards,
+      eq(kanbanBoardCollaborators.boardId, kanbanBoards.id),
+    )
+    .where(
+      and(
+        eq(kanbanBoards.id, boardId),
+        or(
+          eq(kanbanBoardCollaborators.userId, user.id),
+          eq(kanbanBoardCollaborators.email, user.email.toLowerCase()),
+        ),
+      ),
+    );
+
+  if (!shared || shared.collaborator.role !== "full_edit") {
     throw new Error("Board was not found.");
   }
 
-  return board;
+  return { board: shared.board, user, accessRole: "full_edit" as const };
 }
 
-async function assertColumnForUser(columnId: number, userId: number) {
+async function assertColumnForUser(columnId: number) {
   assertId(columnId, "Column");
 
   const [row] = await db
@@ -204,16 +310,18 @@ async function assertColumnForUser(columnId: number, userId: number) {
     })
     .from(kanbanColumns)
     .innerJoin(kanbanBoards, eq(kanbanColumns.boardId, kanbanBoards.id))
-    .where(and(eq(kanbanColumns.id, columnId), eq(kanbanBoards.userId, userId)));
+    .where(eq(kanbanColumns.id, columnId));
 
   if (!row) {
     throw new Error("Column was not found.");
   }
 
-  return row;
+  const access = await assertKanbanBoardAccess(row.board.id);
+
+  return { ...row, user: access.user, accessRole: access.accessRole };
 }
 
-async function assertTaskForUser(taskId: number, userId: number) {
+async function assertTaskForUser(taskId: number) {
   assertId(taskId, "Task");
 
   const [row] = await db
@@ -225,13 +333,15 @@ async function assertTaskForUser(taskId: number, userId: number) {
     .from(kanbanTasks)
     .innerJoin(kanbanColumns, eq(kanbanTasks.columnId, kanbanColumns.id))
     .innerJoin(kanbanBoards, eq(kanbanColumns.boardId, kanbanBoards.id))
-    .where(and(eq(kanbanTasks.id, taskId), eq(kanbanBoards.userId, userId)));
+    .where(eq(kanbanTasks.id, taskId));
 
   if (!row) {
     throw new Error("Task was not found.");
   }
 
-  return row;
+  const access = await assertKanbanBoardAccess(row.board.id);
+
+  return { ...row, user: access.user, accessRole: access.accessRole };
 }
 
 async function getNextTaskPosition(columnId: number) {
@@ -293,23 +403,111 @@ async function syncTaskToCalendar(
   return item.id;
 }
 
-export async function listKanbanBoards() {
-  const user = await syncCurrentUserToDatabase();
-
-  const [boards, columns, tasks] = await Promise.all([
+async function getAccessibleBoardIds(user: typeof users.$inferSelect) {
+  const [ownedBoards, sharedBoards] = await Promise.all([
     db
-      .select()
+      .select({ id: kanbanBoards.id })
       .from(kanbanBoards)
-      .where(eq(kanbanBoards.userId, user.id))
+      .where(eq(kanbanBoards.userId, user.id)),
+    db
+      .select({ id: kanbanBoardCollaborators.boardId })
+      .from(kanbanBoardCollaborators)
+      .where(
+        or(
+          eq(kanbanBoardCollaborators.userId, user.id),
+          eq(kanbanBoardCollaborators.email, user.email.toLowerCase()),
+        ),
+      ),
+  ]);
+
+  return Array.from(
+    new Set([
+      ...ownedBoards.map((board) => board.id),
+      ...sharedBoards.map((board) => board.id),
+    ]),
+  );
+}
+
+async function getBoardCollaborators(boardIds: number[]) {
+  if (boardIds.length === 0) {
+    return new Map<number, KanbanCollaboratorView[]>();
+  }
+
+  const rows = await db
+    .select({
+      collaborator: kanbanBoardCollaborators,
+      user: users,
+    })
+    .from(kanbanBoardCollaborators)
+    .leftJoin(users, eq(kanbanBoardCollaborators.userId, users.id))
+    .where(inArray(kanbanBoardCollaborators.boardId, boardIds))
+    .orderBy(asc(kanbanBoardCollaborators.createdAt));
+
+  const collaboratorsByBoard = new Map<number, KanbanCollaboratorView[]>();
+
+  for (const row of rows) {
+    const collaborator = row.collaborator;
+    const group = collaboratorsByBoard.get(collaborator.boardId) ?? [];
+
+    group.push({
+      id: collaborator.id,
+      email: collaborator.email,
+      role: "full_edit",
+      status: collaborator.status === "accepted" ? "accepted" : "pending",
+      user: row.user ? toUserView(row.user) : null,
+    });
+    collaboratorsByBoard.set(collaborator.boardId, group);
+  }
+
+  return collaboratorsByBoard;
+}
+
+async function getAppOrigin() {
+  if (process.env.NEXT_PUBLIC_APP_URL) {
+    return process.env.NEXT_PUBLIC_APP_URL.replace(/\/$/, "");
+  }
+
+  const requestHeaders = await headers();
+  const host = requestHeaders.get("x-forwarded-host") ?? requestHeaders.get("host");
+  const protocol = requestHeaders.get("x-forwarded-proto") ?? "http";
+
+  if (!host) {
+    return "http://localhost:3000";
+  }
+
+  return `${protocol}://${host}`;
+}
+
+export async function listKanbanBoards(selectedBoardId?: number | null) {
+  const user = await syncCurrentUserToDatabase();
+  await attachCurrentUserToCollaborations(user);
+
+  const accessibleBoardIds = await getAccessibleBoardIds(user);
+
+  if (accessibleBoardIds.length === 0) {
+    return [];
+  }
+
+  if (selectedBoardId) {
+    assertId(selectedBoardId, "Board");
+  }
+
+  const [boards, columns, tasks, collaboratorsByBoard] = await Promise.all([
+    db
+      .select({
+        board: kanbanBoards,
+        owner: users,
+      })
+      .from(kanbanBoards)
+      .innerJoin(users, eq(kanbanBoards.userId, users.id))
+      .where(inArray(kanbanBoards.id, accessibleBoardIds))
       .orderBy(asc(kanbanBoards.createdAt), asc(kanbanBoards.id)),
     db
       .select({
         column: kanbanColumns,
-        board: kanbanBoards,
       })
       .from(kanbanColumns)
-      .innerJoin(kanbanBoards, eq(kanbanColumns.boardId, kanbanBoards.id))
-      .where(eq(kanbanBoards.userId, user.id))
+      .where(inArray(kanbanColumns.boardId, accessibleBoardIds))
       .orderBy(asc(kanbanColumns.position), asc(kanbanColumns.id)),
     db
       .select({
@@ -319,8 +517,9 @@ export async function listKanbanBoards() {
       .from(kanbanTasks)
       .innerJoin(kanbanColumns, eq(kanbanTasks.columnId, kanbanColumns.id))
       .innerJoin(kanbanBoards, eq(kanbanColumns.boardId, kanbanBoards.id))
-      .where(eq(kanbanBoards.userId, user.id))
+      .where(inArray(kanbanBoards.id, accessibleBoardIds))
       .orderBy(asc(kanbanTasks.position), asc(kanbanTasks.id)),
+    getBoardCollaborators(accessibleBoardIds),
   ]);
 
   const tasksByColumn = new Map<number, KanbanTaskView[]>();
@@ -345,12 +544,25 @@ export async function listKanbanBoards() {
     columnsByBoard.set(row.column.boardId, group);
   }
 
-  return boards.map<KanbanBoardView>((board) => ({
-    id: board.id,
-    name: board.name,
-    color: board.color,
-    columns: columnsByBoard.get(board.id) ?? [],
+  const view = boards.map<KanbanBoardView>((row) => ({
+    id: row.board.id,
+    name: row.board.name,
+    color: row.board.color,
+    roomId: getKanbanRoomId(row.board.id),
+    accessRole: row.board.userId === user.id ? "owner" : "full_edit",
+    owner: toUserView(row.owner),
+    collaborators: collaboratorsByBoard.get(row.board.id) ?? [],
+    columns: columnsByBoard.get(row.board.id) ?? [],
   }));
+
+  if (selectedBoardId && view.some((board) => board.id === selectedBoardId)) {
+    return [
+      ...view.filter((board) => board.id === selectedBoardId),
+      ...view.filter((board) => board.id !== selectedBoardId),
+    ];
+  }
+
+  return view;
 }
 
 export async function createKanbanBoard(input: BoardInput) {
@@ -380,12 +592,17 @@ export async function createKanbanBoard(input: BoardInput) {
     )
     .returning();
 
+  await syncKanbanRoomAccess(board.id);
   revalidatePath("/kanban");
 
   return {
     id: board.id,
     name: board.name,
     color: board.color,
+    roomId: getKanbanRoomId(board.id),
+    accessRole: "owner",
+    owner: toUserView(user),
+    collaborators: [],
     columns: insertedColumns.map((column) => ({
       id: column.id,
       boardId: column.boardId,
@@ -396,9 +613,98 @@ export async function createKanbanBoard(input: BoardInput) {
   } satisfies KanbanBoardView;
 }
 
+export async function inviteKanbanBoardCollaborator(boardId: number, emailValue: string) {
+  const { board, user } = await assertKanbanBoardAccess(boardId);
+
+  if (board.userId !== user.id) {
+    throw new Error("Only the board owner can invite collaborators.");
+  }
+
+  const email = normalizeEmail(emailValue);
+
+  if (email === user.email.toLowerCase()) {
+    throw new Error("You already own this board.");
+  }
+
+  const [existingUser] = await db
+    .select()
+    .from(users)
+    .where(eq(users.email, email));
+
+  const [existing] = await db
+    .select()
+    .from(kanbanBoardCollaborators)
+    .where(
+      and(
+        eq(kanbanBoardCollaborators.boardId, boardId),
+        eq(kanbanBoardCollaborators.email, email),
+      ),
+    );
+
+  let clerkInvitationId = existing?.clerkInvitationId ?? null;
+  let message = existing
+    ? "Access is already granted for this email."
+    : "Invite sent and board access granted.";
+
+  if (!existingUser && !clerkInvitationId) {
+    try {
+      const client = await clerkClient();
+      const origin = await getAppOrigin();
+      const invitation = await client.invitations.createInvitation({
+        emailAddress: email,
+        notify: true,
+        redirectUrl: `${origin}/kanban?boardId=${boardId}`,
+        publicMetadata: {
+          kanbanBoardId: boardId,
+        },
+      });
+
+      clerkInvitationId = invitation.id;
+    } catch {
+      message =
+        "Board access was granted. Clerk could not send a new invitation, likely because this email is already invited.";
+    }
+  } else if (existingUser) {
+    message = "Access granted. This user can open the shared board now.";
+  }
+
+  const values = {
+    boardId,
+    email,
+    userId: existingUser?.id ?? null,
+    role: "full_edit",
+    status: existingUser ? "accepted" : "pending",
+    invitedByUserId: user.id,
+    clerkInvitationId,
+    acceptedAt: existingUser ? new Date() : null,
+    updatedAt: new Date(),
+  };
+
+  const [collaborator] = existing
+    ? await db
+        .update(kanbanBoardCollaborators)
+        .set(values)
+        .where(eq(kanbanBoardCollaborators.id, existing.id))
+        .returning()
+    : await db.insert(kanbanBoardCollaborators).values(values).returning();
+
+  await syncKanbanRoomAccess(boardId);
+  revalidatePath("/kanban");
+
+  return {
+    collaborator: {
+      id: collaborator.id,
+      email: collaborator.email,
+      role: "full_edit",
+      status: collaborator.status === "accepted" ? "accepted" : "pending",
+      user: existingUser ? toUserView(existingUser) : null,
+    },
+    message,
+  } satisfies InviteCollaboratorResult;
+}
+
 export async function addKanbanColumn(boardId: number, name: string) {
-  const user = await syncCurrentUserToDatabase();
-  await assertBoardForUser(boardId, user.id);
+  await assertKanbanBoardAccess(boardId);
 
   const currentColumns = await db
     .select()
@@ -438,8 +744,7 @@ export async function addKanbanColumn(boardId: number, name: string) {
 }
 
 export async function renameKanbanColumn(columnId: number, name: string) {
-  const user = await syncCurrentUserToDatabase();
-  await assertColumnForUser(columnId, user.id);
+  await assertColumnForUser(columnId);
   const columnName = name.trim();
 
   if (!columnName) {
@@ -458,8 +763,7 @@ export async function renameKanbanColumn(columnId: number, name: string) {
 }
 
 export async function deleteKanbanColumn(columnId: number) {
-  const user = await syncCurrentUserToDatabase();
-  const { column } = await assertColumnForUser(columnId, user.id);
+  const { column, user } = await assertColumnForUser(columnId);
   const syncedTasks = await db
     .select({ calendarItemId: kanbanTasks.calendarItemId })
     .from(kanbanTasks)
@@ -501,9 +805,8 @@ export async function deleteKanbanColumn(columnId: number) {
 }
 
 export async function createKanbanTask(input: TaskInput) {
-  const user = await syncCurrentUserToDatabase();
   const values = normalizeTaskInput(input);
-  await assertColumnForUser(values.columnId, user.id);
+  const { user } = await assertColumnForUser(values.columnId);
   const calendarItemId = await syncTaskToCalendar(user.id, values, null);
   const now = new Date();
 
@@ -531,17 +834,16 @@ export async function createKanbanTask(input: TaskInput) {
 }
 
 export async function updateKanbanTask(taskId: number, input: TaskInput) {
-  const user = await syncCurrentUserToDatabase();
-  const current = await assertTaskForUser(taskId, user.id);
+  const current = await assertTaskForUser(taskId);
   const values = normalizeTaskInput(input);
-  const target = await assertColumnForUser(values.columnId, user.id);
+  const target = await assertColumnForUser(values.columnId);
 
   if (target.column.boardId !== current.board.id) {
     throw new Error("Tasks can only move within their board.");
   }
 
   const calendarItemId = await syncTaskToCalendar(
-    user.id,
+    current.user.id,
     values,
     current.task.calendarItemId,
   );
@@ -575,8 +877,7 @@ export async function updateKanbanTask(taskId: number, input: TaskInput) {
 }
 
 export async function deleteKanbanTask(taskId: number) {
-  const user = await syncCurrentUserToDatabase();
-  const current = await assertTaskForUser(taskId, user.id);
+  const current = await assertTaskForUser(taskId);
 
   if (current.task.calendarItemId) {
     await db
@@ -584,7 +885,7 @@ export async function deleteKanbanTask(taskId: number) {
       .where(
         and(
           eq(calendarItems.id, current.task.calendarItemId),
-          eq(calendarItems.userId, user.id),
+          eq(calendarItems.userId, current.user.id),
         ),
       );
   }
@@ -596,9 +897,8 @@ export async function deleteKanbanTask(taskId: number) {
 }
 
 export async function moveKanbanTask(taskId: number, targetColumnId: number) {
-  const user = await syncCurrentUserToDatabase();
-  const current = await assertTaskForUser(taskId, user.id);
-  const target = await assertColumnForUser(targetColumnId, user.id);
+  const current = await assertTaskForUser(taskId);
+  const target = await assertColumnForUser(targetColumnId);
 
   if (target.column.boardId !== current.board.id) {
     throw new Error("Tasks can only move within their board.");
