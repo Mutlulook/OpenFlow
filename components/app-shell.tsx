@@ -54,7 +54,7 @@ const menuGroups: MenuGroup[] = [
       },
       {
         label: "Task / Kanban",
-        href: "/",
+        href: "/kanban",
         icon: Columns3,
         color: "text-orange-500",
       },
