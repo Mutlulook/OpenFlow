@@ -7,6 +7,7 @@ import {
   text,
   time,
   timestamp,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
@@ -48,6 +49,35 @@ export const kanbanBoards = pgTable("kanban_boards", {
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
+export const kanbanBoardCollaborators = pgTable(
+  "kanban_board_collaborators",
+  {
+    id: serial("id").primaryKey(),
+    boardId: integer("board_id")
+      .notNull()
+      .references(() => kanbanBoards.id, { onDelete: "cascade" }),
+    email: text("email").notNull(),
+    userId: integer("user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    role: text("role").notNull().default("full_edit"),
+    status: text("status").notNull().default("pending"),
+    invitedByUserId: integer("invited_by_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    clerkInvitationId: text("clerk_invitation_id"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+    acceptedAt: timestamp("accepted_at"),
+  },
+  (table) => ({
+    boardEmailUnique: uniqueIndex("kanban_board_collaborators_board_email_unique").on(
+      table.boardId,
+      table.email,
+    ),
+  }),
+);
+
 export const kanbanColumns = pgTable("kanban_columns", {
   id: serial("id").primaryKey(),
   boardId: integer("board_id")
@@ -85,6 +115,10 @@ export type CalendarItem = typeof calendarItems.$inferSelect;
 export type NewCalendarItem = typeof calendarItems.$inferInsert;
 export type KanbanBoard = typeof kanbanBoards.$inferSelect;
 export type NewKanbanBoard = typeof kanbanBoards.$inferInsert;
+export type KanbanBoardCollaborator =
+  typeof kanbanBoardCollaborators.$inferSelect;
+export type NewKanbanBoardCollaborator =
+  typeof kanbanBoardCollaborators.$inferInsert;
 export type KanbanColumn = typeof kanbanColumns.$inferSelect;
 export type NewKanbanColumn = typeof kanbanColumns.$inferInsert;
 export type KanbanTask = typeof kanbanTasks.$inferSelect;
